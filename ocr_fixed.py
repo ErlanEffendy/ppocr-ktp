@@ -27,7 +27,7 @@ class KTPExtractor:
             'place_of_birth': {'required': True},
             'date_of_birth': {'required': True},
             'gender': {
-                'values': ['LAKI-LAKI', 'PEREMPUAN', 'MALE', 'FEMALE'],
+                'values': ['LAKI-LAKI', 'PEREMPUAN'],
                 'required': True
             },
             'blood_type': {
@@ -42,11 +42,11 @@ class KTPExtractor:
             'village': {'required': True},
             'district': {'required': True},
             'religion': {
-                'values': ['ISLAM', 'KRISTEN', 'KATOLIK', 'KATHOLIK', 'HINDU', 'BUDDHA', 'KHONGHUCU', 'PROTESTANT', 'CHRISTIAN'],
+                'values': ['ISLAM', 'KRISTEN', 'KATOLIK', 'KATHOLIK', 'HINDU', 'BUDDHA', 'KHONGHUCU'],
                 'required': False
             },
             'marital_status': {
-                'values': ['BELUM KAWIN', 'KAWIN', 'CERAI HIDUP', 'CERAI MATI', 'SINGLE', 'MARRIED', 'DIVORCED', 'WIDOWED'],
+                'values': ['BELUM KAWIN', 'KAWIN', 'CERAI HIDUP', 'CERAI MATI'],
                 'required': False
             },
             'occupation': {
@@ -373,32 +373,25 @@ class KTPExtractor:
         # 4. POB/DOB split
         if 'pob_dob' in fields:
             raw_val = fields['pob_dob']['value']
-            # Match Place and Date, allowing for comma, dot, or space separators
-            match = re.search(r'^(.*?)[,\.\s]+(\d{2}[-\s][0-9OA-Z]{2}[-\s]\d{4})', raw_val)
+            match = re.search(r'^(.*?)[,\s]+(\d{2}[-\s][0-9OA-Z]{2}[-\s]\d{4})', raw_val)
             if match:
-                pob = match.group(1).strip(',. ').strip()
+                pob = match.group(1).strip(', ').strip()
                 dob = match.group(2).replace(' ', '-').replace('O', '0').replace('I', '1')
                 fields['place_of_birth'] = {'value': pob, 'confidence': fields['pob_dob']['confidence']}
                 fields['date_of_birth'] = {'value': dob, 'confidence': fields['pob_dob']['confidence']}
             else:
-                # Fallback: try splitting by multiple delimiters
-                parts = re.split(r'[,.\s]', raw_val)
-                # Look for a date-like part at the end
-                if len(parts) >= 2:
-                    pob = " ".join(parts[:-1]).strip(',. ').strip()
-                    dob = parts[-1].strip()
-                    fields['place_of_birth'] = {'value': pob, 'confidence': fields['pob_dob']['confidence']}
-                    fields['date_of_birth'] = {'value': dob, 'confidence': fields['pob_dob']['confidence']}
-            
+                parts = re.split(r'[,]', raw_val, 1)
+                if len(parts) == 2:
+                    fields['place_of_birth'] = {'value': parts[0].strip(), 'confidence': fields['pob_dob']['confidence']}
+                    fields['date_of_birth'] = {'value': parts[1].strip(), 'confidence': fields['pob_dob']['confidence']}
             if 'place_of_birth' in fields and 'date_of_birth' in fields:
                 del fields['pob_dob']
         
         # 5. Global cleanup and noise removal
         if 'gender' in fields:
             val = fields['gender']['value']
-            # Check FEMALE first because it contains 'MALE'
-            if 'PEREM' in val or 'FEMALE' in val: fields['gender']['value'] = 'PEREMPUAN' if 'PEREM' in val else 'FEMALE'
-            elif 'LAKI' in val or 'MALE' in val: fields['gender']['value'] = 'LAKI-LAKI' if 'LAKI' in val else 'MALE'
+            if 'LAKI' in val: fields['gender']['value'] = 'LAKI-LAKI'
+            elif 'PEREM' in val: fields['gender']['value'] = 'PEREMPUAN'
             
         if 'religion' in fields:
             val = fields['religion']['value']
@@ -488,10 +481,33 @@ class KTPExtractor:
         confidences = [f.get('confidence', 0.0) for f in fields.values()]
         return sum(confidences) / len(confidences)
 
-if __name__ == '__main__':
-    import json
-    from ocr import KTPExtractor
+if __name__ == "__main__":
+    # Test end-to-end
     extractor = KTPExtractor()
-    image_path = r'C:/Users/Probuddy/.gemini/antigravity/brain/c8b818c7-b78e-4bb8-a969-d879d81fb039/uploaded_image_1766689876297.jpg'
-    result = extractor.extract(image_path)
+
+    test_images = [
+        'images/ktp-1.jpg', 
+        # r'C:/Users/Probuddy/.gemini/antigravity/brain/86bf6e54-3a09-4263-8562-3ca084359ee8/uploaded_image_1766678261722.jpg'
+    ]
+
+    for img_path in test_images:
+        print(f"\nProcessing: {img_path}")
+        try:
+            result = extractor.extract(img_path)
+            print(f"Overall Confidence: {result['confidence_score']:.2f}")
+            print("\nExtracted Fields:")
+            print(json.dumps(result['fields'], indent=2))
+            print("\nValidation:")
+            print(json.dumps(result['validation'], indent=2))
+        except Exception as e:
+            print(f"Error processing {img_path}: {e}")
+
+    def _calculate_overall_confidence(self, fields):
+        if not fields: return 0.0
+        confidences = [f.get('confidence', 0.0) for f in fields.values()]
+        return sum(confidences) / len(confidences)
+
+if __name__ == '__main__':
+    extractor = KTPExtractor()
+    result = extractor.extract('images/ktp-1.jpg')
     print(json.dumps(result, indent=2))
