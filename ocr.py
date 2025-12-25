@@ -28,13 +28,19 @@ class KTPExtractor:
                 'values': ['LAKI-LAKI', 'PEREMPUAN'],
                 'required': True
             },
-            'blood_type': {'required': False},
+            'blood_type': {
+                'values': ['A', 'B', 'AB', 'O', '-'],
+                'required': False
+            },
             'address': {'required': True},
-            'rt_rw': {'required': True},
+            'rt_rw': {
+                'pattern': r'^\d{3}/\d{3}$',
+                'required': True
+            },
             'village': {'required': True},
             'district': {'required': True},
             'religion': {
-                'values': ['ISLAM', 'KRISTEN', 'KATHOLIK', 'HINDU', 'BUDDHA', 'KHONGHUCU'],
+                'values': ['ISLAM', 'KRISTEN', 'KATOLIK', 'KATHOLIK', 'HINDU', 'BUDDHA', 'KHONGHUCU'],
                 'required': False
             },
             'marital_status': {
@@ -42,51 +48,7 @@ class KTPExtractor:
                 'required': False
             },
             'occupation': {
-              'values': [
-                          "BELUM/TIDAK BEKERJA",
-                          "MENGURUS RUMAH TANGGA",
-                          "PELAJAR/MAHASISWA",
-                          "PENSIUNAN",
-                          "PEGAWAI NEGERI SIPIL (PNS)",
-                          "TENTARA NASIONAL INDONESIA (TNI)",
-                          "KEPOLISIAN RI (POLRI)",
-                          "PERDAGANGAN",
-                          "PETANI/PEKEBUN",
-                          "PETERNAK",
-                          "NELAYAN/PERIKANAN",
-                          "INDUSTRI",
-                          "KONSTRUKSI",
-                          "TRANSPORTASI",
-                          "KARYAWAN SWASTA",
-                          "KARYAWAN BUMN",
-                          "KARYAWAN BUMD",
-                          "KARYAWAN HONORER",
-                          "BURUH HARIAN LEPAS",
-                          "BURUH TANI/PERKEBUNAN",
-                          "BURUH NELAYAN/PERIKANAN",
-                          "BURUH PETERNAKAN",
-                          "AKUNTAN/KONSULTAN KEUANGAN",
-                          "DOKTER",
-                          "TENAGA MEDIS LAINNYA",
-                          "PERAWAT",
-                          "BIDAN",
-                          "APOTEKER",
-                          "PENGACARA/ADVOKAT",
-                          "NOTARIS",
-                          "ARSITEK",
-                          "SENIMAN",
-                          "WARTAWAN",
-                          "GURU",
-                          "DOSEN",
-                          "ROHANIWAN",
-                          "PARANORMAL",
-                          "PERAJIN",
-                          "SOPIR",
-                          "USAHA MIKRO, KECIL, DAN MENENGAH (UMKM)",
-                          "JASA PERSEWAAN PERALATAN PESTA",
-                          "LAINNYA"
-                        ],
-              'required': True
+                'required': True
             },
             'citizenship': {'required': True},
             'expiry_date': {'required': True}
@@ -154,8 +116,9 @@ class KTPExtractor:
         }
     
     def _extract_fields_hybrid(self, ocr_result, image):
-        """Hybrid extraction combining label and template methods"""
+        """Hybrid extraction with robust regex and spatial logic"""
         fields = {}
+        img_h, img_w = image.shape[:2]
         
         texts = ocr_result.get('rec_texts', [])
         scores = ocr_result.get('rec_scores', [])
@@ -164,116 +127,198 @@ class KTPExtractor:
         # Combine into lines
         lines = list(zip(texts, scores, boxes))
         
-        # Define field keywords (mapping to internal keys)
+        # Define field keywords as regex for word boundaries
         field_keywords = {
-            'province': ['provinsi'],
-            'city': ['kabupaten', 'kota'],
-            'nik': ['nik', 'n1k'],
-            'name': ['nama', 'vama', 'ama'],
-            'pob_dob': ['tempat/tgl lahir', 'lahir'],
-            'gender': ['jenis kelamin', 'kelamin'],
-            'blood_type': ['gol. darah', 'darah'],
-            'address': ['alamat', 'lamat'],
-            'rt_rw': ['rt/rw'],
-            'village': ['kel/desa', 'desa'],
-            'district': ['kecamatan'],
-            'religion': ['agama'],
-            'marital_status': ['status perkawinan', 'status'],
-            'occupation': ['pekerjaan'],
-            'citizenship': ['kewarganegaraan'],
-            'expiry_date': ['berlaku hingga', 'berlaku'],
+            'province': [re.compile(r'\bPROVINSI\b', re.I)],
+            'city': [re.compile(r'\bKABUPATEN\b', re.I), re.compile(r'\bKOTA\b', re.I)],
+            'nik': [re.compile(r'\bNIK\b', re.I), re.compile(r'\bN1K\b', re.I)],
+            'name': [re.compile(r'\bNAMA\b', re.I), re.compile(r'\bVAMA\b', re.I)],
+            'pob_dob': [re.compile(r'TEMPAT\s*/\s*TGL\s*LAHIR', re.I), re.compile(r'\bLAHIR\b', re.I)],
+            'gender': [re.compile(r'JENIS\s*KELAMIN', re.I), re.compile(r'\bKELAMIN\b', re.I)],
+            'blood_type': [re.compile(r'GOL\.\s*DARAH', re.I)],
+            'address': [re.compile(r'\bAL[A\s]*M[A\s]*T\b', re.I), re.compile(r'\bLAMAT\b', re.I)],
+            'rt_rw': [re.compile(r'\bRT/RW\b', re.I)],
+            'village': [re.compile(r'KEL/DESA', re.I), re.compile(r'\bDESA\b', re.I)],
+            'district': [re.compile(r'\bKECAMATAN\b', re.I)],
+            'religion': [re.compile(r'\bAGAMA\b', re.I)],
+            'marital_status': [re.compile(r'STATUS\s*PERKAWINAN', re.I), re.compile(r'\bSTATUS\b', re.I)],
+            'occupation': [re.compile(r'\bPEKERJAAN\b', re.I)],
+            'citizenship': [re.compile(r'\bKEWARGANEGARAAN\b', re.I)],
+            'expiry_date': [re.compile(r'BERLAKU\s*HINGGA', re.I), re.compile(r'\bBERLAKU\b', re.I)],
         }
+
+        # 1. Identify all likely label indices first with spatial constraint
+        label_map = {} # label_idx -> field_key
+        all_label_indices = set()
         
+        for idx, (text, _, box) in enumerate(lines):
+            # KTP labels are generally on the left side
+            # Relaxed for Address specifically as it might be shifted
+            is_address_candidate = any(p.search(text) for p in field_keywords['address'])
+            x_limit = img_w * 0.45 if is_address_candidate else img_w * 0.4
+            
+            if box[0] > x_limit:
+                continue
+                
+            for field_key, patterns in field_keywords.items():
+                if any(p.search(text) for p in patterns):
+                    label_map[idx] = field_key
+                    all_label_indices.add(idx)
+                    break
+
         # Helper to find value for a label
         def find_value_for_label(label_idx, field_key=None, search_range=4):
             label_text, _, label_box = lines[label_idx]
-            
-            # 1. Check if the value is in the same text block (separated by colon)
-            if ':' in label_text:
-                parts = label_text.split(':', 1)
-                if len(parts) > 1 and parts[1].strip():
-                    val = parts[1].strip()
-                    if field_key == 'nik':
-                        clean = val.replace(' ', '').replace('O', '0').replace('I', '1').replace('B', '8')
-                        if len(clean) == 16:
-                            return clean, lines[label_idx][1]
-                    return val, lines[label_idx][1]
-            
-            # 2. Check subsequent lines for spatial proximity (Y-coordinate overlap)
             label_y_mid = label_box[1] + label_box[3] / 2
             
-            candidates = []
+            # Helper to extract clean 16 digits from a string
+            def get_nik_from_str(s):
+                clean = re.sub(r'\D', '', s.replace('O', '0').replace('I', '1').replace('B', '8'))
+                if len(clean) >= 16:
+                    # Take the rightmost 16 digits to avoid stray noise prefixes (like marker digits)
+                    return clean[-16:]
+                return None
+
+            # Check for value in same block (after colon)
+            if ':' in label_text:
+                parts = label_text.split(':', 1)
+                if len(parts) > 1:
+                    val = parts[1].strip()
+                    if val:
+                        if field_key == 'nik':
+                            nik = get_nik_from_str(val)
+                            if nik: return nik, lines[label_idx][1]
+                        else:
+                            return val, lines[label_idx][1]
             
+            # Check subsequent lines
+            candidates = []
             for i in range(label_idx + 1, min(label_idx + search_range + 1, len(lines))):
+                if i in all_label_indices: break
+                    
                 curr_text, curr_score, curr_box = lines[i]
                 curr_y_mid = curr_box[1] + curr_box[3] / 2
                 
-                # Check vertical alignment (within 45 pixels)
-                if abs(label_y_mid - curr_y_mid) < 45:
-                    # Also ensure it's to the right of the label
+                # Tight vertical window
+                v_threshold = max(20, label_box[3] * 0.5)
+                if abs(label_y_mid - curr_y_mid) < v_threshold:
                     if curr_box[0] > label_box[0] + 5:
                         val = curr_text.lstrip(': ').strip()
                         if val:
+                            # For NIK, if this box alone is 16 digits, it's a very strong candidate
+                            if field_key == 'nik':
+                                nik = get_nik_from_str(val)
+                                if nik: return nik, curr_score
+                            
                             candidates.append((val, curr_score, curr_box[0]))
             
             if candidates:
-                # Special logic for NIK: if any candidate is exactly 16 digits, take it
-                if field_key == 'nik':
-                    for val, score, _ in candidates:
-                        clean = val.replace(' ', '').replace('O', '0').replace('I', '1').replace('B', '8')
-                        if len(clean) == 16:
-                            return clean, score
-
-                # Sort by X-position to ensure correct order
                 candidates.sort(key=lambda x: x[2])
-                merged_val = " ".join([c[0] for c in candidates])
-                avg_score = sum([c[1] for c in candidates]) / len(candidates)
-                return merged_val, avg_score
+                # Special NIK handling for merged candidates
+                if field_key == 'nik':
+                    merged_raw = "".join([c[0] for c in candidates])
+                    nik = get_nik_from_str(merged_raw)
+                    if nik: return nik, sum([c[1] for c in candidates]) / len(candidates)
+                else:
+                    merged_val = " ".join([c[0] for c in candidates])
+                    avg_score = sum([c[1] for c in candidates]) / len(candidates)
+                    return merged_val, avg_score
                         
             return None, 0.0
 
-        for field_key, keywords in field_keywords.items():
-            for idx, (text, score, box) in enumerate(lines):
-                text_lower = text.lower()
-                if any(kw in text_lower for kw in keywords):
-                    val, val_score = find_value_for_label(idx, field_key=field_key)
-                    if val:
-                        fields[field_key] = {
-                            'value': val.upper(),
-                            'confidence': val_score,
-                            'bbox': box.tolist() if hasattr(box, 'tolist') else box
-                        }
-                        break
+        # 2. Extract values for identified labels
+        for idx, field_key in label_map.items():
+            if field_key in fields: continue
+            
+            val, val_score = find_value_for_label(idx, field_key=field_key)
+            if val:
+                # Negative filtering for Name: don't pick up common address words
+                if field_key == 'name':
+                    addr_words = ['DUSUN', 'DESA', 'KELURAHAN', 'KECAMATAN', 'RT/RW', 'RT', 'RW', 'KABUPATEN', 'PROVINSI']
+                    if any(word in val.upper() for word in addr_words):
+                        continue
+                        
+                fields[field_key] = {
+                    'value': val.upper(),
+                    'confidence': val_score,
+                    'bbox': lines[idx][2].tolist() if hasattr(lines[idx][2], 'tolist') else lines[idx][2]
+                }
+
+        # Pre-extract Province/City if possible for cleaning
+        if 'province' not in fields:
+            for text, score, _ in lines[:5]:
+                if 'PROVINSI' in text.upper():
+                    fields['province'] = {'value': text.upper().replace('PROVINSI', '').strip(), 'confidence': score}
+                    break
         
-        # Post-process POB/DOB split
+        if 'city' not in fields:
+            for text, score, _ in lines[:8]:
+                if any(kw in text.upper() for kw in ['KABUPATEN', 'KOTA']):
+                    val = text.upper().replace('KABUPATEN', '').replace('KOTA', '').strip()
+                    fields['city'] = {'value': val, 'confidence': score}
+                    break
+
+        # 3. Alamat sub-fields (indented)
+        if 'address' in fields:
+            addr_idx = [i for i, k in label_map.items() if k == 'address'][0]
+            for i in range(addr_idx + 1, min(addr_idx + 10, len(lines))):
+                if i in all_label_indices: continue
+                
+                text = lines[i][0].upper().strip()
+                score = lines[i][1]
+                box = lines[i][2]
+                
+                if 'rt_rw' not in fields and re.search(r'\d{3}/\d{3}', text):
+                    match = re.search(r'(\d{3}/\d{3})', text)
+                    fields['rt_rw'] = {'value': match.group(1), 'confidence': score, 'bbox': box.tolist()}
+                
+        # 4. POB/DOB split
         if 'pob_dob' in fields:
             raw_val = fields['pob_dob']['value']
-            # Split by comma or space before date pattern
-            parts = re.split(r'[,]', raw_val, 1)
-            if len(parts) == 2:
-                fields['place_of_birth'] = {'value': parts[0].strip(), 'confidence': fields['pob_dob']['confidence']}
-                fields['date_of_birth'] = {'value': parts[1].strip(), 'confidence': fields['pob_dob']['confidence']}
+            match = re.search(r'^(.*?)[,\s]+(\d{2}[-\s][0-9OA-Z]{2}[-\s]\d{4})', raw_val)
+            if match:
+                pob = match.group(1).strip(', ').strip()
+                dob = match.group(2).replace(' ', '-').replace('O', '0').replace('I', '1')
+                fields['place_of_birth'] = {'value': pob, 'confidence': fields['pob_dob']['confidence']}
+                fields['date_of_birth'] = {'value': dob, 'confidence': fields['pob_dob']['confidence']}
             else:
-                # Fallback: look for date pattern at the end
-                date_match = re.search(r'(\d{2}-\d{2}-\d{4})', raw_val)
-                if date_match:
-                    dob = date_match.group(1)
-                    pob = raw_val.replace(dob, '').strip(', ').strip()
-                    fields['place_of_birth'] = {'value': pob, 'confidence': fields['pob_dob']['confidence']}
-                    fields['date_of_birth'] = {'value': dob, 'confidence': fields['pob_dob']['confidence']}
-            
-            # Remove raw field if both splits succeeded
+                parts = re.split(r'[,]', raw_val, 1)
+                if len(parts) == 2:
+                    fields['place_of_birth'] = {'value': parts[0].strip(), 'confidence': fields['pob_dob']['confidence']}
+                    fields['date_of_birth'] = {'value': parts[1].strip(), 'confidence': fields['pob_dob']['confidence']}
             if 'place_of_birth' in fields and 'date_of_birth' in fields:
                 del fields['pob_dob']
         
-        # Special handling for Province and City (usually first two lines, might not have labels)
-        if 'province' not in fields and len(lines) > 0:
-             if 'PROVINSI' in lines[0][0]:
-                 fields['province'] = {'value': lines[0][0].replace('PROVINSI', '').strip(), 'confidence': lines[0][1]}
+        # 5. Global cleanup and noise removal
+        if 'gender' in fields:
+            val = fields['gender']['value']
+            if 'LAKI' in val: fields['gender']['value'] = 'LAKI-LAKI'
+            elif 'PEREM' in val: fields['gender']['value'] = 'PEREMPUAN'
+            
+        if 'religion' in fields:
+            val = fields['religion']['value']
+            for rel in self.validation_rules['religion']['values']:
+                if rel in val:
+                    fields['religion']['value'] = rel
+                    break
+
+        # Cross-field cleaning (Removing city names and leaked dates from Occupation/Name)
+        blacklist = []
+        if 'city' in fields: blacklist.append(fields['city']['value'])
+        if 'province' in fields: blacklist.append(fields['province']['value'])
+        if 'place_of_birth' in fields: blacklist.append(fields['place_of_birth']['value'])
         
-        if 'city' not in fields and len(lines) > 1:
-             if any(kw in lines[1][0] for kw in ['KABUPATEN', 'KOTA']):
-                 fields['city'] = {'value': lines[1][0].replace('KABUPATEN', '').replace('KOTA', '').strip(), 'confidence': lines[1][1]}
+        for field_key in ['occupation', 'name']:
+            if field_key in fields:
+                val = fields[field_key]['value']
+                # Remove city/province names from end
+                for item in blacklist:
+                    if len(item) > 3 and val.endswith(item):
+                        val = val[:len(val)-len(item)].strip(', ').strip()
+                
+                # Remove trailing dates (common leakage from Issue Date)
+                val = re.sub(r'[\s,-]+\d{2}[-\s][0-9O]{2}[-\s]\d{4}$', '', val)
+                fields[field_key]['value'] = val.strip()
 
         return fields
 
