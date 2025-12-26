@@ -128,9 +128,7 @@ class KTPExtractor:
         
         # Combine into lines
         lines = list(zip(texts, scores, boxes))
-        # 
-# [ 6] Score: 0.9410 | Box: [ 13 ... 162] | Text: 'Tempat/TgiLahir'
-# [ 7] Score: 0.9767 | Box: [191 ... 164] | Text: 'FUJIAN,25-03-1977'
+        
         # Define field keywords as regex for word boundaries
         field_keywords = {
             'province': [re.compile(r'\bPROVINSI\b', re.I)],
