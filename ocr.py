@@ -1,4 +1,4 @@
-from paddleocr import PaddleOCR
+import easyocr
 import cv2
 import re
 import json
@@ -11,10 +11,7 @@ class KTPExtractor:
     def __init__(self):
         # Reuse OCR model across instances to avoid reloading
         if KTPExtractor._ocr_instance is None:
-            KTPExtractor._ocr_instance = PaddleOCR(
-                use_textline_orientation=True,
-                lang='en'
-            )
+            KTPExtractor._ocr_instance = easyocr.Reader(['en'], gpu=False)
         self.ocr = KTPExtractor._ocr_instance
         
         self.validation_rules = {
@@ -104,12 +101,12 @@ class KTPExtractor:
         
         # Run OCR
         ocr_start = time.time()
-        result = self.ocr.predict(processed)
+        result = self.ocr.readtext(processed)
         ocr_time = time.time() - ocr_start
         
         # Extract fields using hybrid approach
         extract_start = time.time()
-        fields = self._extract_fields_hybrid(result[0], processed)
+        fields = self._extract_fields_hybrid(result, processed)
         
         # Validate
         validation = self._validate_fields(fields)
@@ -134,12 +131,20 @@ class KTPExtractor:
         fields = {}
         img_h, img_w = image.shape[:2]
         
-        texts = ocr_result.get('rec_texts', [])
-        scores = ocr_result.get('rec_scores', [])
-        boxes = ocr_result.get('rec_boxes', [])
-        
-        # Combine into lines
-        lines = list(zip(texts, scores, boxes))
+        # Convert EasyOCR result format: [(text, confidence, bbox), ...] where bbox is list of 4 points
+        # Convert to format compatible with existing code: (text, confidence, [x1, y1, x2, y2])
+        lines = []
+        for item in ocr_result:
+            bbox_points = item[0]  # List of 4 points: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+            text = item[1]
+            confidence = item[2]
+            
+            # Convert 4-point bbox to axis-aligned bbox [x1, y1, x2, y2]
+            x_coords = [p[0] for p in bbox_points]
+            y_coords = [p[1] for p in bbox_points]
+            bbox = np.array([min(x_coords), min(y_coords), max(x_coords), max(y_coords)])
+            
+            lines.append((text, confidence, bbox))
         
         # Define field keywords as regex for word boundaries
         field_keywords = {
