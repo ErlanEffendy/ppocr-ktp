@@ -1,499 +1,202 @@
-from paddleocr import PaddleOCR
-import cv2
-import re
+from dotenv import load_dotenv
+import os
+from google import genai
+from google.genai import types
 import json
-import numpy as np
 import time
 
+load_dotenv()
+
 class KTPExtractor:
-    _ocr_instance = None  # Singleton pattern for model
-    
     def __init__(self):
-        # Reuse OCR model across instances to avoid reloading
-        if KTPExtractor._ocr_instance is None:
-            KTPExtractor._ocr_instance = PaddleOCR(
-                use_textline_orientation=True,
-                lang='en'
-            )
-        self.ocr = KTPExtractor._ocr_instance
+        self.api_key = os.getenv("GEMINI_API_KEY")
+        if not self.api_key:
+            print("WARNING: GEMINI_API_KEY not found in environment variables.")
+            self.client = None
+        else:
+            self.client = genai.Client(api_key=self.api_key)
+            
+        # Fallback models: User desired 2.5, but we fallback to 2.0 and 1.5 if 2.5 is rate limited or unavailable.
+        self.models = ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-3-flash"]
+        print(f"KTPExtractor initialized with models: {self.models}")
         
         self.validation_rules = {
             'province': {'required': True},
             'city': {'required': True},
-            'nik': {
-                'pattern': r'^\d{16}$',
-                'required': True
-            },
-            'name': {
-                'pattern': r'^[A-Z\s\.]{3,}$',
-                'required': True
-            },
+            'nik': {'pattern': r'^\d{16}$', 'required': True},
+            'name': {'pattern': r'^[A-Z\s\.]{3,}$', 'required': True},
             'place_of_birth': {'required': True},
             'date_of_birth': {'required': True},
-            'gender': {
-                'values': ['LAKI-LAKI', 'PEREMPUAN', 'MALE', 'FEMALE'],
-                'required': True
-            },
-            'blood_type': {
-                'values': ['A', 'B', 'AB', 'O', '-'],
-                'required': False
-            },
+            'gender': {'values': ['LAKI-LAKI', 'PEREMPUAN', 'MALE', 'FEMALE'], 'required': True},
+            'blood_type': {'values': ['A', 'B', 'AB', 'O', '-'], 'required': False},
             'address': {'required': True},
-            'rt_rw': {
-                'pattern': r'^\d{3}/\d{3}$',
-                'required': True
-            },
+            'rt_rw': {'pattern': r'^\d{3}\s*/\s*\d{3}$', 'required': True},
             'village': {'required': True},
             'district': {'required': True},
-            'religion': {
-                'values': ['ISLAM', 'KRISTEN', 'KATOLIK', 'KATHOLIK', 'HINDU', 'BUDDHA', 'KHONGHUCU', 'PROTESTANT', 'CHRISTIAN'],
-                'required': False
-            },
-            'marital_status': {
-                'values': ['BELUM KAWIN', 'KAWIN', 'CERAI HIDUP', 'CERAI MATI', 'SINGLE', 'MARRIED', 'DIVORCED', 'WIDOWED'],
-                'required': False
-            },
-            'occupation': {
-                'required': True
-            },
+            'religion': {'values': ['ISLAM', 'KRISTEN', 'KATOLIK', 'KATHOLIK', 'HINDU', 'BUDDHA', 'KHONGHUCU', 'PROTESTANT', 'CHRISTIAN'], 'required': False},
+            'marital_status': {'values': ['BELUM KAWIN', 'KAWIN', 'CERAI HIDUP', 'CERAI MATI', 'SINGLE', 'MARRIED', 'DIVORCED', 'WIDOWED'], 'required': False},
+            'occupation': {'required': True},
             'citizenship': {'required': True},
             'expiry_date': {'required': True}
         }
-    
-    def preprocess(self, image_path):
-        """Apply optimal preprocessing - prioritize speed over quality"""
-        image = cv2.imread(image_path)
-        if image is None:
-            raise FileNotFoundError(f"Could not load image at {image_path}")
-        
-        # Aggressive resize: 1280px max (OCR works fine at this size, ~60% faster)
-        h, w = image.shape[:2]
-        max_dimension = 1280  # Reduced from 1920 for faster inference
-        if w > max_dimension or h > max_dimension:
-            scale = max_dimension / max(w, h)
-            image = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
-        
-        # Skip perspective correction and most preprocessing for speed
-        # Light preprocessing only: fast blur + contrast boost
-        image = cv2.GaussianBlur(image, (3, 3), 0)  # Ultra-fast blur
-        
-        # Quick contrast enhancement using simple histogram
-        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-        l_channel = lab[:,:,0]
-        # Faster: use numpy histogram stretching instead of CLAHE
-        p2, p98 = np.percentile(l_channel, (2, 98))
-        l_channel = np.clip((l_channel - p2) / (p98 - p2) * 255, 0, 255).astype(np.uint8)
-        lab[:,:,0] = l_channel
-        image = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-        
-        return image
-    
-    def _correct_perspective(self, image):
-        """Detect and correct perspective distortion"""
-        # Simplified version - implement full version from POC 2
-        return image
-    
+
     def extract(self, image_path):
-        """Extract all fields from KTP"""
+        """Extract all fields from KTP using Gemini with model fallback"""
         start_time = time.time()
         
-        # Preprocess
-        pre_start = time.time()
-        processed = self.preprocess(image_path)
-        pre_time = time.time() - pre_start
-        
-        # Run OCR
-        ocr_start = time.time()
-        result = self.ocr.predict(processed)
-        ocr_time = time.time() - ocr_start
-        
-        # Extract fields using hybrid approach
-        extract_start = time.time()
-        fields = self._extract_fields_hybrid(result[0], processed)
-        
-        # Validate
-        validation = self._validate_fields(fields)
-        extract_time = time.time() - extract_start
-        
-        total_time = time.time() - start_time
-        
-        return {
-            'fields': fields,
-            'validation': validation,
-            'confidence_score': self._calculate_overall_confidence(fields),
-            'performance': {
-                'total_time': total_time,
-                'preprocessing_time': pre_time,
-                'ocr_inference_time': ocr_time,
-                'extraction_time': extract_time
+        try:
+            if not self.client:
+                 raise ValueError("Gemini Client not initialized. Check API Key.")
+
+            # Load image bytes
+            with open(image_path, "rb") as f:
+                image_bytes = f.read()
+
+            # Determine mime type
+            mime_type = "image/jpeg"
+            if image_path.lower().endswith(".png"):
+                mime_type = "image/png"
+            elif image_path.lower().endswith(".webp"):
+                mime_type = "image/webp"
+
+            prompt = """
+            Extract the data from this Indonesian KTP (Identity Card) image. 
+            Return a valid JSON object strictly matching this structure for the fields.
+            
+            Required JSON Structure:
+            {
+                "province": "PROVINSI ...",
+                "city": "KOTA ... or KABUPATEN ...",
+                "nik": "16 digit number",
+                "name": "Full Name",
+                "place_of_birth": "Place",
+                "date_of_birth": "DD-MM-YYYY",
+                "gender": "LAKI-LAKI or PEREMPUAN",
+                "blood_type": "A/B/O/AB/-",
+                "address": "Address line",
+                "rt_rw": "000/000",
+                "village": "Village/Desa",
+                "district": "Kecamatan",
+                "religion": "RELIGION",
+                "marital_status": "MARITAL STATUS",
+                "occupation": "OCCUPATION",
+                "citizenship": "WNI/WNA",
+                "expiry_date": "DD-MM-YYYY or SEUMUR HIDUP"
             }
-        }
-    
-    def _extract_fields_hybrid(self, ocr_result, image):
-        """Hybrid extraction with robust regex and spatial logic"""
-        fields = {}
-        img_h, img_w = image.shape[:2]
-        
-        texts = ocr_result.get('rec_texts', [])
-        scores = ocr_result.get('rec_scores', [])
-        boxes = ocr_result.get('rec_boxes', [])
-        
-        # Combine into lines
-        lines = list(zip(texts, scores, boxes))
-        
-        # Define field keywords as regex for word boundaries
-        field_keywords = {
-            'province': [re.compile(r'\bPROVINSI\b', re.I)],
-            'city': [re.compile(r'\bKABUPATEN\b', re.I), re.compile(r'\bKOTA\b', re.I)],
-            'nik': [re.compile(r'\bNIK\b', re.I), re.compile(r'\bN1K\b', re.I)],
-            'name': [re.compile(r'\bNAMA\b', re.I), re.compile(r'\bVAMA\b', re.I)],
-            'pob_dob': [re.compile(r'TEMPAT\s*/\s*TGL\s*LAHIR', re.I), re.compile(r'\bLAHIR\b', re.I)],
-            'gender': [re.compile(r'JENIS\s*KELAMIN', re.I), re.compile(r'\bKELAMIN\b', re.I)],
-            'blood_type': [re.compile(r'GOL\.\s*DARAH', re.I)],
-            'address': [re.compile(r'[A4]L[A\s4]*M[A\s4]*[Tf7l1I]', re.I), re.compile(r'L[A\s]*M[A\s]*[Tf7l1I]', re.I)],
-            'rt_rw': [re.compile(r'RT\s*/\s*RW', re.I)],
-            'village': [re.compile(r'KEL/DESA', re.I), re.compile(r'DESA\b', re.I)],
-            'district': [re.compile(r'KECAMATAN', re.I)],
-            'religion': [re.compile(r'\bAGAMA\b', re.I)],
-            'marital_status': [re.compile(r'STATUS\s*PERKAWINAN', re.I), re.compile(r'\bSTATUS\b', re.I)],
-            'occupation': [re.compile(r'\bPEKERJAAN\b', re.I)],
-            'citizenship': [re.compile(r'\bKEWARGANEGARAAN\b', re.I)],
-            'expiry_date': [re.compile(r'BERLAKU\s*HINGGA', re.I), re.compile(r'\bBERLAKU\b', re.I)],
-        }
-
-        # 1. Identify all likely label indices first with spatial constraint
-        label_map = {} # label_idx -> field_key
-        all_label_indices = set()
-        
-        # Pre-compile regex patterns (avoid recompiling in loop)
-        regex_cache = {}
-        for field_key, patterns in field_keywords.items():
-            regex_cache[field_key] = patterns
-        
-        # Canonical names for fuzzy matching - pre-process
-        canonical_map = {
-            'PROVINSI': 'province',
-            'KABUPATEN': 'city',
-            'KOTA': 'city',
-            'NIK': 'nik',
-            'NAMA': 'name',
-            'TEMPAT/TGL LAHIR': 'pob_dob',
-            'JENIS KELAMIN': 'gender',
-            'GOL. DARAH': 'blood_type',
-            'ALAMAT': 'address',
-            'RT/RW': 'rt_rw',
-            'KEL/DESA': 'village',
-            'KECAMATAN': 'district',
-            'AGAMA': 'religion',
-            'STATUS PERKAWINAN': 'marital_status',
-            'PEKERJAAN': 'occupation',
-            'KEWARGANEGARAAN': 'citizenship',
-            'BERLAKU HINGGA': 'expiry_date'
-        }
-        canonical_list = list(canonical_map.keys())
-        
-        # Pre-compute cleaned canonical strings
-        canonical_clean = {c: re.sub(r'[:\-\s/]', '', c) for c in canonical_list}
-        
-        for idx, (text, _, box) in enumerate(lines):
-            bx1 = box[0] if not isinstance(box[0], (list, np.ndarray)) else box[0][0]
-            # KTP labels are generally on the left side
-            is_addr_region = any(kw in text.upper() for kw in ['ALAMAT', 'RT/', 'RW', 'DESA', 'KECAMATAN'])
-            x_limit = img_w * 0.45 if is_addr_region else img_w * 0.4
             
-            if bx1 > x_limit:
-                continue
+            If a field is not visible or clear, return null or an empty string.
+            """
 
-            found = False
-            # Pass 1: Regex only (skip fuzzy matching for speed)
-            for field_key, patterns in regex_cache.items():
-                if any(p.search(text) for p in patterns):
-                    label_map[idx] = field_key
-                    all_label_indices.add(idx)
-                    found = True
+            response = None
+            last_error = None
+            
+            print(f"DEBUG: Available models: {self.models}")
+            
+            for i, model_name in enumerate(self.models):
+                print(f"DEBUG: Attempting model {i+1}/{len(self.models)}: {model_name}")
+                try:
+                    response = self.client.models.generate_content(
+                        model=model_name,
+                        contents=[
+                            types.Content(
+                                parts=[
+                                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                                    types.Part.from_text(text=prompt)
+                                ]
+                            )
+                        ],
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json"
+                        )
+                    )
+                    print(f"DEBUG: Success with model: {model_name}")
                     break
+                except Exception as e:
+                    print(f"DEBUG: Model {model_name} failed with error type {type(e).__name__}: {e}")
+                    last_error = e
+                    # Explicitly continue, though it happens automatically
+                    continue
+                except BaseException as be:
+                    print(f"DEBUG: Model {model_name} failed with CRITICAL error type {type(be).__name__}: {be}")
+                    last_error = be
+                    continue
             
-            # Skip Pass 2 (Fuzzy matching) for performance - keep only regex matching
-
-        # Helper to find value for a label
-        def find_value_for_label(label_idx, field_key=None, search_range=None):
-            if search_range is None:
-                search_range = 1 if field_key in ['gender', 'blood_type', 'religion', 'citizenship'] else 2
+            if response is None:
+                raise last_error if last_error else Exception("All models failed to extract data.")
             
-            label_text, _, label_box = lines[label_idx]
-            # Assuming [x1, y1, x2, y2]
-            lx1, ly1, lx2, ly2 = label_box
-            label_y_mid = (ly1 + ly2) / 2
-            l_height = ly2 - ly1
+            text = response.text
+             # basic cleanup if model includes markdown
+            if text.startswith("```json"):
+                text = text[7:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
             
-            # Helper to extract clean 16 digits from a string
-            def get_nik_from_str(s):
-                clean = re.sub(r'\D', '', s.replace('O', '0').replace('I', '1').replace('B', '8'))
-                if len(clean) >= 16:
-                    return clean[-16:]
-                return None
-
-            # Check for value in same block (after colon)
-            if ':' in label_text:
-                parts = label_text.split(':', 1)
-                if len(parts) > 1:
-                    val = parts[1].strip()
-                    if val:
-                        if field_key == 'nik':
-                            nik = get_nik_from_str(val)
-                            if nik: return nik, lines[label_idx][1], label_box
-                        else:
-                            return val, lines[label_idx][1], label_box
+            data = json.loads(text)
             
-            # Check subsequent lines
-            candidates = []
-            for i in range(label_idx + 1, min(label_idx + search_range + 1, len(lines))):
-                if i in all_label_indices: break
-                    
-                curr_text, curr_score, curr_box = lines[i]
-                cx1, cy1, cx2, cy2 = curr_box
-                curr_y_mid = (cy1 + cy2) / 2
-                
-                # Tight vertical window
-                v_threshold = max(20, l_height * 0.8)
-                if abs(label_y_mid - curr_y_mid) < v_threshold:
-                    # If current line starts too far left, it's likely a misidentified label rather than a value
-                    # (Unless it's the RT/RW which is shifted left)
-                    if cx1 < img_w * 0.15 and field_key not in ['province', 'city', 'rt_rw']:
-                        break
-                        
-                    if cx1 > lx1 + 5:
-                        val = curr_text.lstrip(': ').strip()
-                        if val:
-                            if field_key == 'nik':
-                                nik = get_nik_from_str(val)
-                                if nik: return nik, curr_score, curr_box
-                            
-                            candidates.append({
-                                'text': val,
-                                'score': curr_score,
-                                'bbox': curr_box
-                            })
-                elif curr_y_mid > label_y_mid + v_threshold:
-                    # Line is too far below, stop searching to avoid sweeping up unrelated fields
-                    break
-            
-            if candidates:
-                candidates.sort(key=lambda x: x['bbox'][0])
-                # Special NIK handling for merged candidates
-                if field_key == 'nik':
-                    merged_raw = "".join([c['text'] for c in candidates])
-                    nik = get_nik_from_str(merged_raw)
-                    if nik: 
-                        avg_score = sum([c['score'] for c in candidates]) / len(candidates)
-                        return nik, avg_score, candidates[0]['bbox']
-                else:
-                    merged_val = " ".join([c['text'] for c in candidates])
-                    avg_score = sum([c['score'] for c in candidates]) / len(candidates)
-                    return merged_val, avg_score, candidates[0]['bbox']
-                        
-            return None, 0.0, None
-
-        # 2. Extract values for identified labels
-        for idx, field_key in label_map.items():
-            if field_key in fields: continue
-            
-            val, val_score, val_bbox = find_value_for_label(idx, field_key=field_key)
-            if val:
-                # Negative filtering for Name: don't pick up common address words
-                if field_key == 'name':
-                    addr_words = ['DUSUN', 'DESA', 'KELURAHAN', 'KECAMATAN', 'RT/RW', 'RT', 'RW', 'KABUPATEN', 'PROVINSI']
-                    if any(word in val.upper() for word in addr_words):
-                        continue
-                        
-                fields[field_key] = {
-                    'value': val.upper(),
-                    'confidence': val_score,
-                    'bbox': val_bbox.tolist() if hasattr(val_bbox, 'tolist') else val_bbox
+            formatted_fields = {}
+            for key in self.validation_rules.keys():
+                val = data.get(key, "")
+                if val is None: val = ""
+                formatted_fields[key] = {
+                    'value': str(val).upper(),
+                    'confidence': 1.0, 
+                    'bbox': []
                 }
 
-        # Pre-extract Province/City if possible for cleaning
-        if 'province' not in fields:
-            for text, score, _ in lines[:5]:
-                if 'PROVINSI' in text.upper():
-                    fields['province'] = {'value': text.upper().replace('PROVINSI', '').strip(), 'confidence': score}
-                    break
-        
-        if 'city' not in fields:
-            for text, score, box in lines[:8]:
-                if any(kw in text.upper() for kw in ['KABUPATEN', 'KOTA']):
-                    val = text.upper().replace('KABUPATEN', '').replace('KOTA', '').strip()
-                    fields['city'] = {'value': val, 'confidence': score}
-                    break
-                    
-        # City fallback: check line below Province if still missing
-        if 'city' not in fields:
-            prov_line_idx = -1
-            for i, (text, _, _) in enumerate(lines[:5]):
-                if 'PROVINSI' in text.upper():
-                    prov_line_idx = i
-                    break
+            validation = self._validate_fields(formatted_fields)
+            total_time = time.time() - start_time
             
-            if prov_line_idx != -1 and prov_line_idx + 1 < len(lines):
-                cand_text, cand_score, cand_box = lines[prov_line_idx + 1]
-                # Ensure it's not another label and it's physically close
-                major_labels = ['NIK', 'NAMA', 'TEMPAT', 'JENIS', 'ALAMAT', 'RT/', 'AGAMA', 'PEKERJAAN']
-                if not any(lab in cand_text.upper() for lab in major_labels):
-                    if cand_box[1] < img_h * 0.25: # Cities are always near the top
-                        fields['city'] = {'value': cand_text.upper().strip(), 'confidence': cand_score}
-
-        # Sub-field logic improvement: use pivot region
-        pivot_idx = -1
-        if 'address' in fields:
-            pivot_idx = [i for i, k in label_map.items() if k == 'address'][0]
-        else:
-            # Global fallback find RT/RW pattern to locate address region
-            for idx, (text, _, _) in enumerate(lines):
-                if re.search(r'\d{3}/\d{3}', text):
-                    pivot_idx = idx - 1 if idx > 0 else 0
-                    break
-
-        if pivot_idx != -1:
-            for i in range(max(0, pivot_idx), min(pivot_idx + 12, len(lines))):
-                if (i in label_map and label_map[i] not in ['address', 'rt_rw', 'village', 'district']):
-                    if i > pivot_idx: break # Hit another major label
-                
-                text = lines[i][0].upper().strip()
-                score = lines[i][1]
-                box = lines[i][2]
-                
-                if 'rt_rw' not in fields and re.search(r'\d{3}/\d{3}', text):
-                    match = re.search(r'(\d{3}/\d{3})', text)
-                    # Take rightmost 7 characters to avoid noise prefixes
-                    val = match.group(1)
-                    fields['rt_rw'] = {'value': val, 'confidence': score, 'bbox': box.tolist() if hasattr(box, 'tolist') else box}
-                elif 'village' not in fields and i in label_map and label_map[i] == 'village':
-                    val, s, b = find_value_for_label(i, field_key='village')
-                    if val: fields['village'] = {'value': val.upper(), 'confidence': s, 'bbox': b.tolist() if hasattr(b, 'tolist') else b}
-                elif 'district' not in fields and i in label_map and label_map[i] == 'district':
-                    val, s, b = find_value_for_label(i, field_key='district')
-                    if val: fields['district'] = {'value': val.upper(), 'confidence': s, 'bbox': b.tolist() if hasattr(b, 'tolist') else b}
-                elif 'address' not in fields and i > pivot_idx and ':' not in text and (box[0] if not isinstance(box[0], (list, np.ndarray)) else box[0][0]) > img_w * 0.2:
-                    # Potential multiline address value. Must NOT be purely numeric to avoid misidentifying RT/RW blocks.
-                    if not re.match(r'^[\d\s/]+$', text):
-                        fields['address'] = {'value': text, 'confidence': score, 'bbox': box.tolist() if hasattr(box, 'tolist') else box}
-                
-        # 4. POB/DOB split
-        if 'pob_dob' in fields:
-            raw_val = fields['pob_dob']['value']
-            # Match Place and Date, allowing for comma, dot, or space separators
-            match = re.search(r'^(.*?)[,\.\s]+(\d{2}[-\s][0-9OA-Z]{2}[-\s]\d{4})', raw_val)
-            if match:
-                pob = match.group(1).strip(',. ').strip()
-                dob = match.group(2).replace(' ', '-').replace('O', '0').replace('I', '1')
-                fields['place_of_birth'] = {'value': pob, 'confidence': fields['pob_dob']['confidence']}
-                fields['date_of_birth'] = {'value': dob, 'confidence': fields['pob_dob']['confidence']}
-            else:
-                # Fallback: try splitting by multiple delimiters
-                parts = re.split(r'[,.\s]', raw_val)
-                # Look for a date-like part at the end
-                if len(parts) >= 2:
-                    pob = " ".join(parts[:-1]).strip(',. ').strip()
-                    dob = parts[-1].strip()
-                    fields['place_of_birth'] = {'value': pob, 'confidence': fields['pob_dob']['confidence']}
-                    fields['date_of_birth'] = {'value': dob, 'confidence': fields['pob_dob']['confidence']}
+            return {
+                'fields': formatted_fields,
+                'validation': validation,
+                'confidence_score': 1.0, 
+                'performance': {
+                    'total_time': total_time,
+                    'preprocessing_time': 0,
+                    'ocr_inference_time': total_time,
+                    'extraction_time': 0,
+                    'model_used': response.model_version if hasattr(response, 'model_version') else "unknown"
+                }
+            }
             
-            if 'place_of_birth' in fields and 'date_of_birth' in fields:
-                del fields['pob_dob']
-        
-        # 5. Global cleanup and noise removal
-        if 'gender' in fields:
-            val = fields['gender']['value']
-            # Check FEMALE first because it contains 'MALE'
-            if 'PEREM' in val or 'FEMALE' in val: fields['gender']['value'] = 'PEREMPUAN' if 'PEREM' in val else 'FEMALE'
-            elif 'LAKI' in val or 'MALE' in val: fields['gender']['value'] = 'LAKI-LAKI' if 'LAKI' in val else 'MALE'
-            
-        if 'religion' in fields:
-            val = fields['religion']['value']
-            for rel in self.validation_rules['religion']['values']:
-                if rel in val:
-                    fields['religion']['value'] = rel
-                    break
-
-        # Cross-field cleaning (Removing city names and leaked dates from Occupation/Name)
-        blacklist = []
-        if 'city' in fields: blacklist.append(fields['city']['value'])
-        if 'province' in fields: blacklist.append(fields['province']['value'])
-        if 'place_of_birth' in fields: blacklist.append(fields['place_of_birth']['value'])
-        
-        for field_key in ['occupation', 'name']:
-            if field_key in fields:
-                val = fields[field_key]['value']
-                # Remove city/province names from end
-                for item in blacklist:
-                    if len(item) > 3 and val.endswith(item):
-                        val = val[:len(val)-len(item)].strip(', ').strip()
-                
-                # Remove trailing dates (common leakage from Issue Date)
-                val = re.sub(r'[\s,-]+\d{2}[-\s][0-9O]{2}[-\s]\d{4}$', '', val)
-                fields[field_key]['value'] = val.strip()
-
-        return fields
+        except Exception as e:
+            print(f"Error during Gemini extraction: {e}")
+            raise e
 
     def _validate_fields(self, fields):
-        """Validate extracted fields - fast version, skip fuzzy matching"""
+        """Reuse existing validation logic simple version"""
         validation = {}
-        
-        # Only validate required fields for speed
         required_only = {k: v for k, v in self.validation_rules.items() if v.get('required', False)}
         
         for field_name, rules in required_only.items():
             if field_name not in fields:
-                validation[field_name] = {
-                    'valid': False,
-                    'error': 'Missing field'
-                }
+                validation[field_name] = {'valid': False, 'error': 'Missing field'}
                 continue
             
             value = fields[field_name].get('value', '')
             
-            # Pre-validation cleaning
-            if field_name == 'nik':
-                value = value.replace(' ', '').replace('O', '0').replace('I', '1').replace('B', '8')
-            elif field_name == 'name':
-                # Remove any stray numbers from name
-                value = re.sub(r'\d', '', value).strip()
-            
-            # Pattern validation only
+            # Simple pattern validation
             if 'pattern' in rules:
+                import re
                 if not re.match(rules['pattern'], value):
-                    validation[field_name] = {
-                        'valid': False,
-                        'error': 'Pattern mismatch'
-                    }
+                    validation[field_name] = {'valid': False, 'error': 'Pattern mismatch'}
                     continue
             
-            # Skip expensive fuzzy matching - trust OCR output
-            # Value set validation (exact match only)
             if 'values' in rules:
                 if value not in rules['values']:
-                    validation[field_name] = {
-                        'valid': False,
-                        'error': f'Invalid value: {value}'
-                    }
-                    continue
-            
+                   validation[field_name] = {'valid': False, 'error': f'Invalid value: {value}'}
+                   continue
+
             validation[field_name] = {'valid': True}
-        
         return validation
-    
+
     def _calculate_overall_confidence(self, fields):
-        """Calculate overall extraction confidence"""
-        if not fields:
-            return 0.0
-        
-        confidences = [f.get('confidence', 0.0) for f in fields.values()]
-        return sum(confidences) / len(confidences)
+        return 1.0
 
 if __name__ == '__main__':
-    import json
-    from ocr import KTPExtractor
+    # Test block
     extractor = KTPExtractor()
-    image_path = r'C:/Users/Probuddy/.gemini/antigravity/brain/c8b818c7-b78e-4bb8-a969-d879d81fb039/uploaded_image_1766689876297.jpg'
-    result = extractor.extract(image_path)
-    print(json.dumps(result, indent=2))
+    # Replace with a real path if you want to test locally
+    # image_path = 'path/to/test.jpg'
+    # print(json.dumps(extractor.extract(image_path), indent=2))
