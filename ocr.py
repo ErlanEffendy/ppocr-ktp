@@ -194,9 +194,177 @@ class KTPExtractor:
     def _calculate_overall_confidence(self, fields):
         return 1.0
 
+class NPWPExtractor:
+    def __init__(self):
+        self.api_key = os.getenv("GEMINI_API_KEY")
+        if not self.api_key:
+            print("WARNING: GEMINI_API_KEY not found in environment variables.")
+            self.client = None
+        else:
+            self.client = genai.Client(api_key=self.api_key)
+            
+        # Fallback models
+        self.models = ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-3-flash"]
+        print(f"NPWPExtractor initialized with models: {self.models}")
+        
+        self.validation_rules = {
+            'npwp_number': {'pattern': r'^\d{2}\.\d{3}\.\d{3}\.\d{1}-\d{3}\.\d{3}$', 'required': True},
+            'taxpayer_name': {'required': True},
+            'address': {'required': True},
+            'city': {'required': True},
+            'province': {'required': True},
+            'kpp': {'required': False},
+            'registration_date': {'required': False},
+        }
+
+    def extract(self, image_path):
+        """Extract all fields from NPWP using Gemini with model fallback"""
+        start_time = time.time()
+        
+        try:
+            if not self.client:
+                 raise ValueError("Gemini Client not initialized. Check API Key.")
+
+            # Load image bytes
+            with open(image_path, "rb") as f:
+                image_bytes = f.read()
+
+            # Determine mime type
+            mime_type = "image/jpeg"
+            if image_path.lower().endswith(".png"):
+                mime_type = "image/png"
+            elif image_path.lower().endswith(".webp"):
+                mime_type = "image/webp"
+
+            prompt = """
+            Extract the data from this Indonesian NPWP (Nomor Pokok Wajib Pajak) card image. 
+            Return a valid JSON object strictly matching this structure for the fields.
+            
+            Required JSON Structure:
+            {
+                "npwp_number": "XX.XXX.XXX.X-XXX.XXX",
+                "taxpayer_name": "Full Name",
+                "address": "Full Address without city and province",
+                "city": "City or Regency (KOTA name/KABUPATEN name)",
+                "province": "Province name",
+                "kpp": "KPP Name (Kantor Pelayanan Pajak)",
+                "registration_date": "DD-MM-YYYY (or similar format found on card)"
+            }
+            
+            Notes:
+            - npwp_number should be formatted with dots and dash if possible.
+            - Extract city and province from the address or other text if available.
+            - If a field is not visible or clear, return null or an empty string.
+            """
+
+            response = None
+            last_error = None
+            
+            print(f"DEBUG: Available models: {self.models}")
+            
+            for i, model_name in enumerate(self.models):
+                print(f"DEBUG: Attempting model {i+1}/{len(self.models)}: {model_name}")
+                try:
+                    response = self.client.models.generate_content(
+                        model=model_name,
+                        contents=[
+                            types.Content(
+                                parts=[
+                                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                                    types.Part.from_text(text=prompt)
+                                ]
+                            )
+                        ],
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json"
+                        )
+                    )
+                    print(f"DEBUG: Success with model: {model_name}")
+                    break
+                except Exception as e:
+                    print(f"DEBUG: Model {model_name} failed with error type {type(e).__name__}: {e}")
+                    last_error = e
+                    continue
+                except BaseException as be:
+                    print(f"DEBUG: Model {model_name} failed with CRITICAL error type {type(be).__name__}: {be}")
+                    last_error = be
+                    continue
+            
+            if response is None:
+                raise last_error if last_error else Exception("All models failed to extract data.")
+            
+            text = response.text
+             # basic cleanup if model includes markdown
+            if text.startswith("```json"):
+                text = text[7:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+            
+            data = json.loads(text)
+            
+            formatted_fields = {}
+            for key in self.validation_rules.keys():
+                val = data.get(key, "")
+                if val is None: val = ""
+                formatted_fields[key] = {
+                    'value': str(val).upper(),
+                    'confidence': 1.0, 
+                    'bbox': []
+                }
+
+            validation = self._validate_fields(formatted_fields)
+            total_time = time.time() - start_time
+            
+            return {
+                'fields': formatted_fields,
+                'validation': validation,
+                'confidence_score': 1.0, 
+                'performance': {
+                    'total_time': total_time,
+                    'preprocessing_time': 0,
+                    'ocr_inference_time': total_time,
+                    'extraction_time': 0,
+                    'model_used': response.model_version if hasattr(response, 'model_version') else "unknown"
+                }
+            }
+            
+        except Exception as e:
+            print(f"Error during Gemini extraction: {e}")
+            raise e
+
+    def _validate_fields(self, fields):
+        """Reuse existing validation logic simple version"""
+        validation = {}
+        required_only = {k: v for k, v in self.validation_rules.items() if v.get('required', False)}
+        
+        for field_name, rules in required_only.items():
+            if field_name not in fields:
+                validation[field_name] = {'valid': False, 'error': 'Missing field'}
+                continue
+            
+            value = fields[field_name].get('value', '')
+            
+            # Simple pattern validation
+            if 'pattern' in rules:
+                import re
+                if not re.match(rules['pattern'], value):
+                    validation[field_name] = {'valid': False, 'error': 'Pattern mismatch'}
+                    continue
+            
+            if 'values' in rules:
+                if value not in rules['values']:
+                   validation[field_name] = {'valid': False, 'error': f'Invalid value: {value}'}
+                   continue
+
+            validation[field_name] = {'valid': True}
+        return validation
+
 if __name__ == '__main__':
     # Test block
-    extractor = KTPExtractor()
+    # extractor = KTPExtractor()
+    extractor = NPWPExtractor()
     # Replace with a real path if you want to test locally
-    # image_path = 'path/to/test.jpg'
-    # print(json.dumps(extractor.extract(image_path), indent=2))
+    # image_path = 'images/ktp-1.jpg'
+    image_path = 'images/npwp/NPWP.png'
+    print(json.dumps(extractor.extract(image_path), indent=2))
