@@ -4,6 +4,107 @@ import re
 import json
 import numpy as np
 import time
+import requests
+import os
+import pickle
+
+class RegionalMatcher:
+    """Helper to match Indonesian regional names (Province, City, District, Village)"""
+    BASE_URL = "https://emsifa.github.io/api-wilayah-indonesia/api"
+    CACHE_DIR = ".cache_regional"
+
+    def __init__(self, extractor_ref):
+        self.extractor = extractor_ref
+        os.makedirs(self.CACHE_DIR, exist_ok=True)
+        self.provinces = self._load_data("provinces.json")
+        self._city_cache = {}
+        self._district_cache = {}
+        self._village_cache = {}
+
+    def _load_data(self, endpoint):
+        cache_path = os.path.join(self.CACHE_DIR, endpoint.replace("/", "_"))
+        if os.path.exists(cache_path):
+            with open(cache_path, "rb") as f:
+                return pickle.load(f)
+        
+        try:
+            url = f"{self.BASE_URL}/{endpoint}"
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                with open(cache_path, "wb") as f:
+                    pickle.dump(data, f)
+                return data
+        except Exception as e:
+            print(f"Warning: Could not fetch regional data from {endpoint}: {e}")
+        return []
+
+    def _fuzzy_match(self, text, items, prefixes_to_strip, threshold=0.5):
+        if not text: return None, None
+        
+        input_raw = text.upper()
+        
+        # Clean versions for base comparison
+        clean_input = input_raw
+        for p in prefixes_to_strip:
+            clean_input = re.sub(rf'^{p}\b\s*', '', clean_input, flags=re.I)
+        clean_input = clean_input.strip()
+        
+        best_match = None
+        max_score = 0
+        
+        for item in items:
+            orig_name = item['name'].upper()
+            
+            # Clean candidate
+            clean_cand = orig_name
+            for p in prefixes_to_strip:
+                clean_cand = re.sub(rf'^{p}\b\s*', '', clean_cand, flags=re.I)
+            clean_cand = clean_cand.strip()
+            
+            # Distance between clean versions
+            dist = self.extractor._levenshtein_distance(clean_input, clean_cand)
+            max_len = max(len(clean_input), len(clean_cand))
+            base_sim = 1 - (dist / max_len) if max_len > 0 else 1.0
+            
+            # Bonus for label matching
+            label_match_bonus = 0
+            for p in prefixes_to_strip:
+                if (p in input_raw) == (p in orig_name):
+                    label_match_bonus += 0.05 # Small boost for same label status
+            
+            score = base_sim + label_match_bonus
+            
+            if score > max_score:
+                max_score = score
+                best_match = item
+        
+        # Adjust threshold check to use base_sim or final score
+        # We want at least a decent base similarity
+        if best_match and (max_score - 0.05) >= threshold:
+            return best_match['name'], best_match['id']
+        return None, None
+
+    def match_province(self, text):
+        return self._fuzzy_match(text, self.provinces, ["PROVINSI"], threshold=0.5)
+
+    def match_city(self, text, province_id):
+        if not province_id: return None, None
+        if province_id not in self._city_cache:
+            self._city_cache[province_id] = self._load_data(f"regencies/{province_id}.json")
+        return self._fuzzy_match(text, self._city_cache[province_id], ["KABUPATEN", "KOTA", "KAB"], threshold=0.5)
+
+    def match_district(self, text, city_id):
+        if not city_id: return None, None
+        if city_id not in self._district_cache:
+            self._district_cache[city_id] = self._load_data(f"districts/{city_id}.json")
+        return self._fuzzy_match(text, self._district_cache[city_id], ["KECAMATAN", "KEC"], threshold=0.5)
+
+    def match_village(self, text, district_id):
+        if not district_id: return None, None
+        if district_id not in self._village_cache:
+            self._village_cache[district_id] = self._load_data(f"villages/{district_id}.json")
+        return self._fuzzy_match(text, self._village_cache[district_id], ["KEL/DESA", "KELURAHAN", "DESA", "KEL"], threshold=0.5)
 
 class KTPExtractor:
     _ocr_instance = None  # Singleton pattern for model
@@ -16,6 +117,7 @@ class KTPExtractor:
                 lang='en'
             )
         self.ocr = KTPExtractor._ocr_instance
+        self.regional_matcher = RegionalMatcher(self)
         
         self.validation_rules = {
             'province': {'required': True},
@@ -410,10 +512,44 @@ class KTPExtractor:
             
         if 'religion' in fields:
             val = fields['religion']['value']
-            for rel in self.validation_rules['religion']['values']:
-                if rel in val:
-                    fields['religion']['value'] = rel
-                    break
+            # Boost: use fuzzy matching for religion
+            best_religion = self._fuzzy_correct(val, self.validation_rules['religion']['values'])
+            if best_religion:
+                fields['religion']['value'] = best_religion
+
+        if 'marital_status' in fields:
+            val = fields['marital_status']['value']
+            # Boost: use fuzzy matching for marital status
+            best_status = self._fuzzy_correct(val, self.validation_rules['marital_status']['values'])
+            if best_status:
+                fields['marital_status']['value'] = best_status
+
+        # 6. Hierarchical Regional Correction
+        prov_id = None
+        if 'province' in fields:
+            best_name, pid = self.regional_matcher.match_province(fields['province']['value'])
+            if best_name:
+                fields['province']['value'] = best_name
+                prov_id = pid
+        
+        city_id = None
+        if 'city' in fields and prov_id:
+            best_name, cid = self.regional_matcher.match_city(fields['city']['value'], prov_id)
+            if best_name:
+                fields['city']['value'] = best_name
+                city_id = cid
+        
+        dist_id = None
+        if 'district' in fields and city_id:
+            best_name, did = self.regional_matcher.match_district(fields['district']['value'], city_id)
+            if best_name:
+                fields['district']['value'] = best_name
+                dist_id = did
+        
+        if 'village' in fields and dist_id:
+            best_name, vid = self.regional_matcher.match_village(fields['village']['value'], dist_id)
+            if best_name:
+                fields['village']['value'] = best_name
 
         # Cross-field cleaning (Removing city names and leaked dates from Occupation/Name)
         blacklist = []
@@ -468,19 +604,63 @@ class KTPExtractor:
                     }
                     continue
             
-            # Skip expensive fuzzy matching - trust OCR output
-            # Value set validation (exact match only)
+            # Fuzzy matching for value set validation
             if 'values' in rules:
                 if value not in rules['values']:
-                    validation[field_name] = {
-                        'valid': False,
-                        'error': f'Invalid value: {value}'
-                    }
-                    continue
+                    # Try fuzzy matching before failing
+                    best_match = self._fuzzy_correct(value, rules['values'])
+                    if best_match:
+                        fields[field_name]['value'] = best_match
+                    else:
+                        validation[field_name] = {
+                            'valid': False,
+                            'error': f'Invalid value: {value}'
+                        }
+                        continue
             
             validation[field_name] = {'valid': True}
         
         return validation
+
+    def _levenshtein_distance(self, s1, s2):
+        """Calculate the Levenshtein distance between two strings"""
+        if len(s1) < len(s2):
+            return self._levenshtein_distance(s2, s1)
+        if len(s2) == 0:
+            return len(s1)
+        
+        previous_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+        return previous_row[-1]
+
+    def _fuzzy_correct(self, text, candidates, threshold=0.6):
+        """Find the best matching candidate based on Levenshtein distance"""
+        if not text:
+            return None
+        
+        text = text.upper()
+        best_match = None
+        max_similarity = 0
+        
+        for candidate in candidates:
+            candidate = candidate.upper()
+            distance = self._levenshtein_distance(text, candidate)
+            # Normalize similarity: 1 - (distance / max_length)
+            max_len = max(len(text), len(candidate))
+            similarity = 1 - (distance / max_len) if max_len > 0 else 1.0
+            
+            if similarity > max_similarity:
+                max_similarity = similarity
+                best_match = candidate
+        
+        return best_match if max_similarity >= threshold else None
     
     def _calculate_overall_confidence(self, fields):
         """Calculate overall extraction confidence"""
@@ -494,6 +674,6 @@ if __name__ == '__main__':
     import json
     from ocr import KTPExtractor
     extractor = KTPExtractor()
-    image_path = r'C:/Users/Probuddy/.gemini/antigravity/brain/c8b818c7-b78e-4bb8-a969-d879d81fb039/uploaded_image_1766689876297.jpg'
+    image_path = 'images/ktp2.jpg'
     result = extractor.extract(image_path)
     print(json.dumps(result, indent=2))
