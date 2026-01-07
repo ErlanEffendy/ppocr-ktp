@@ -7,6 +7,7 @@ import time
 import requests
 import os
 import pickle
+from ultralytics import YOLO
 
 class RegionalMatcher:
     """Helper to match Indonesian regional names (Province, City, District, Village)"""
@@ -119,6 +120,10 @@ class KTPExtractor:
         self.ocr = KTPExtractor._ocr_instance
         self.regional_matcher = RegionalMatcher(self)
         
+        # Load YOLO field detection model
+        self.yolo_model = YOLO('model/yolo11/best.pt')
+        self.field_names = self.yolo_model.names
+        
         self.validation_rules = {
             'province': {'required': True},
             'city': {'required': True},
@@ -196,22 +201,141 @@ class KTPExtractor:
         return image
     
     def extract(self, image_path):
-        """Extract all fields from KTP"""
+        """Extract all fields from KTP using field detection and individual OCR"""
         start_time = time.time()
         
         # Preprocess
         pre_start = time.time()
+        # For YOLO, we might want the original image for crops
+        original_image = cv2.imread(image_path)
+        if original_image is None:
+            raise FileNotFoundError(f"Could not load image at {image_path}")
+        
         processed = self.preprocess(image_path)
         pre_time = time.time() - pre_start
         
-        # Run OCR
-        ocr_start = time.time()
-        result = self.ocr.predict(processed)
-        ocr_time = time.time() - ocr_start
+        # 1. Detect fields using YOLO
+        yolo_start = time.time()
+        # Note: YOLO usually works better on original or standard resized image
+        # We use processed here if it's already optimized, but YOLO handles its own resize
+        yolo_results = self.yolo_model(original_image, verbose=False)[0]
+        yolo_time = time.time() - yolo_start
         
-        # Extract fields using hybrid approach
+        # 2. Extract fields by cropping and running OCR
         extract_start = time.time()
-        fields = self._extract_fields_hybrid(result[0], processed)
+        fields = {}
+        
+        # Map YOLO class names to our internal field keys
+        yolo_to_field = {
+            'nik': 'nik',
+            'name': 'name',
+            'birth': 'pob_dob',
+            'gender': 'gender',
+            'blood_type': 'blood_type',
+            'address': 'address',
+            'rt_rw': 'rt_rw',
+            'subdistrict': 'village', # KEL/DESA
+            'district': 'district',   # KECAMATAN
+            'religion': 'religion',
+            'marital_status': 'marital_status',
+            'job': 'occupation',
+            'citizenship': 'citizenship',
+            'occur_until': 'expiry_date',
+            'province_city': 'province_city'
+        }
+        
+        detected_boxes = {}
+        for box in yolo_results.boxes:
+            cls_id = int(box.cls[0])
+            label = self.field_names[cls_id]
+            conf = float(box.conf[0])
+            coords = box.xyxy[0].tolist() # [x1, y1, x2, y2]
+            
+            field_key = yolo_to_field.get(label)
+            if not field_key:
+                continue
+                
+            # If multiple detections for same field, take highest confidence
+            if field_key not in detected_boxes or conf > detected_boxes[field_key]['confidence']:
+                detected_boxes[field_key] = {
+                    'bbox': coords,
+                    'confidence': conf
+                }
+        
+        # Run OCR on each detected field crop
+        for field_key, info in detected_boxes.items():
+            bbox = info['bbox']
+            x1, y1, x2, y2 = map(int, bbox)
+            
+            # Add padding to crop: 20px horizontal, 5px vertical
+            h_padding = 100
+            v_padding = 20
+            h_orig, w_orig = original_image.shape[:2]
+            x1 = max(0, x1 - h_padding)
+            y1 = max(0, y1 - v_padding)
+            x2 = min(w_orig, x2 + h_padding)
+            y2 = min(h_orig, y2 + v_padding)
+            
+            crop = original_image[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+                
+            # Run PaddleOCR on the crop
+            # PaddleOCR expects a list for result if using image array
+            ocr_res = self.ocr.predict(crop)
+            
+            if ocr_res and ocr_res[0]['rec_texts']:
+                # Combine multiple lines in one crop if any
+                text = " ".join(ocr_res[0]['rec_texts']).strip()
+                # Clean prefix colons or noise
+                text = re.sub(r'^[:\s]+', '', text)
+                
+                fields[field_key] = {
+                    'value': text.upper(),
+                    'confidence': sum(ocr_res[0]['rec_scores']) / len(ocr_res[0]['rec_scores']),
+                    'bbox': bbox
+                }
+
+        # Special handling for province_city split
+        if 'province_city' in fields:
+            pc_val = fields['province_city']['value']
+            # Often it contains PROVINSI ... KOTA ...
+            # We'll use a simpler heuristic or the regional matcher later
+            lines = pc_val.split('\n') if '\n' in pc_val else [pc_val]
+            # If we merged with " ", try to split if we see provincial keywords
+            if 'PROVINSI' in pc_val:
+                parts = re.split(r'(?=KABUPATEN|KOTA)', pc_val, flags=re.I)
+                if len(parts) >= 2:
+                    fields['province'] = {'value': parts[0].replace('PROVINSI', '').strip(), 'confidence': fields['province_city']['confidence']}
+                    fields['city'] = {'value': parts[1].strip(), 'confidence': fields['province_city']['confidence']}
+                else:
+                    fields['province'] = {'value': pc_val.replace('PROVINSI', '').strip(), 'confidence': fields['province_city']['confidence']}
+            else:
+                # Fallback if only one line detected
+                fields['city'] = {'value': pc_val, 'confidence': fields['province_city']['confidence']}
+            del fields['province_city']
+
+        # Split POB/DOB as before
+        if 'pob_dob' in fields:
+            raw_val = fields['pob_dob']['value']
+            match = re.search(r'^(.*?)[,\.\s]+(\d{2}[-\s][0-9OA-Z]{2}[-\s]\d{4})', raw_val)
+            if match:
+                pob = match.group(1).strip(',. ').strip()
+                dob = match.group(2).replace(' ', '-').replace('O', '0').replace('I', '1')
+                fields['place_of_birth'] = {'value': pob, 'confidence': fields['pob_dob']['confidence']}
+                fields['date_of_birth'] = {'value': dob, 'confidence': fields['pob_dob']['confidence']}
+            else:
+                parts = re.split(r'[,.\s]', raw_val)
+                if len(parts) >= 2:
+                    pob = " ".join(parts[:-1]).strip(',. ').strip()
+                    dob = parts[-1].strip()
+                    fields['place_of_birth'] = {'value': pob, 'confidence': fields['pob_dob']['confidence']}
+                    fields['date_of_birth'] = {'value': dob, 'confidence': fields['pob_dob']['confidence']}
+            if 'place_of_birth' in fields and 'date_of_birth' in fields:
+                del fields['pob_dob']
+
+        # Apply corrections and regional matching
+        fields = self._apply_final_corrections(fields)
         
         # Validate
         validation = self._validate_fields(fields)
@@ -226,10 +350,57 @@ class KTPExtractor:
             'performance': {
                 'total_time': total_time,
                 'preprocessing_time': pre_time,
-                'ocr_inference_time': ocr_time,
+                'yolo_inference_time': yolo_time,
                 'extraction_time': extract_time
             }
         }
+
+    def _apply_final_corrections(self, fields):
+        """Re-use existing correction logic but adapted for field-based output"""
+        # Cleanup gender
+        if 'gender' in fields:
+            val = fields['gender']['value']
+            if 'PEREM' in val or 'FEMALE' in val: fields['gender']['value'] = 'PEREMPUAN'
+            elif 'LAKI' in val or 'MALE' in val: fields['gender']['value'] = 'LAKI-LAKI'
+            
+        if 'religion' in fields:
+            val = fields['religion']['value']
+            best_religion = self._fuzzy_correct(val, self.validation_rules['religion']['values'])
+            if best_religion: fields['religion']['value'] = best_religion
+
+        if 'marital_status' in fields:
+            val = fields['marital_status']['value']
+            best_status = self._fuzzy_correct(val, self.validation_rules['marital_status']['values'])
+            if best_status: fields['marital_status']['value'] = best_status
+
+        # Regional Correction
+        prov_id = None
+        if 'province' in fields:
+            best_name, pid = self.regional_matcher.match_province(fields['province']['value'])
+            if best_name:
+                fields['province']['value'] = best_name
+                prov_id = pid
+        
+        city_id = None
+        if 'city' in fields and prov_id:
+            best_name, cid = self.regional_matcher.match_city(fields['city']['value'], prov_id)
+            if best_name:
+                fields['city']['value'] = best_name
+                city_id = cid
+        
+        dist_id = None
+        if 'district' in fields and city_id:
+            best_name, did = self.regional_matcher.match_district(fields['district']['value'], city_id)
+            if best_name:
+                fields['district']['value'] = best_name
+                dist_id = did
+        
+        if 'village' in fields and dist_id:
+            best_name, vid = self.regional_matcher.match_village(fields['village']['value'], dist_id)
+            if best_name:
+                fields['village']['value'] = best_name
+
+        return fields
     
     def _extract_fields_hybrid(self, ocr_result, image):
         """Hybrid extraction with robust regex and spatial logic"""
