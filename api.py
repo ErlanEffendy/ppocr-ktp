@@ -1,10 +1,19 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from ocr import KTPExtractor
 import os
 import uuid
 import shutil
 
 app = FastAPI(title="KTP OCR API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 extractor = KTPExtractor()
 
 @app.post("/extract")
