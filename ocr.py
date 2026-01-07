@@ -7,6 +7,7 @@ import time
 import requests
 import os
 import pickle
+from ultralytics import YOLO
 
 class RegionalMatcher:
     """Helper to match Indonesian regional names (Province, City, District, Village)"""
@@ -107,7 +108,8 @@ class RegionalMatcher:
         return self._fuzzy_match(text, self._village_cache[district_id], ["KEL/DESA", "KELURAHAN", "DESA", "KEL"], threshold=0.5)
 
 class KTPExtractor:
-    _ocr_instance = None  # Singleton pattern for model
+    _ocr_instance = None  # Singleton pattern for OCR
+    _seg_model_instance = None # Singleton pattern for Segmentation
     
     def __init__(self):
         # Reuse OCR model across instances to avoid reloading
@@ -117,6 +119,16 @@ class KTPExtractor:
                 lang='en'
             )
         self.ocr = KTPExtractor._ocr_instance
+        
+        # Load YOLOv11 segmentation model
+        if KTPExtractor._seg_model_instance is None:
+            model_path = os.path.join('seg_model', 'yolo11', 'best.pt')
+            if os.path.exists(model_path):
+                KTPExtractor._seg_model_instance = YOLO(model_path)
+            else:
+                print(f"Warning: Segmentation model not found at {model_path}")
+                
+        self.seg_model = KTPExtractor._seg_model_instance
         self.regional_matcher = RegionalMatcher(self)
         
         self.validation_rules = {
@@ -162,27 +174,14 @@ class KTPExtractor:
             'expiry_date': {'required': True}
         }
     
-    def preprocess(self, image_path):
-        """Apply optimal preprocessing - prioritize speed over quality"""
-        image = cv2.imread(image_path)
-        if image is None:
-            raise FileNotFoundError(f"Could not load image at {image_path}")
-        
-        # Aggressive resize: 1280px max (OCR works fine at this size, ~60% faster)
-        h, w = image.shape[:2]
-        max_dimension = 1280  # Reduced from 1920 for faster inference
-        if w > max_dimension or h > max_dimension:
-            scale = max_dimension / max(w, h)
-            image = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
-        
-        # Skip perspective correction and most preprocessing for speed
+    def preprocess_warped(self, image):
+        """Apply light preprocessing to warped image"""
         # Light preprocessing only: fast blur + contrast boost
-        image = cv2.GaussianBlur(image, (3, 3), 0)  # Ultra-fast blur
+        image = cv2.GaussianBlur(image, (3, 3), 0)
         
-        # Quick contrast enhancement using simple histogram
+        # Quick contrast enhancement
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
         l_channel = lab[:,:,0]
-        # Faster: use numpy histogram stretching instead of CLAHE
         p2, p98 = np.percentile(l_channel, (2, 98))
         l_channel = np.clip((l_channel - p2) / (p98 - p2) * 255, 0, 255).astype(np.uint8)
         lab[:,:,0] = l_channel
@@ -195,13 +194,94 @@ class KTPExtractor:
         # Simplified version - implement full version from POC 2
         return image
     
+    def _detect_and_warp(self, image):
+        """Detect KTP using YOLOv11 and apply perspective warp or bounding box crop"""
+        if self.seg_model is None:
+            return image
+            
+        results = self.seg_model(image, verbose=False)
+        if not results or len(results[0]) == 0:
+            return image
+            
+        # Get the first detection (assume it's the KTP)
+        result = results[0]
+
+        # 2. Bounding Box Crop (Fallback)
+        if result.boxes is not None:
+            # results[0].boxes.xyxy is (N, 4) tensor
+            box = result.boxes.xyxy[0].cpu().numpy().astype(int)
+            x1, y1, x2, y2 = box
+            # Ensure coordinates are within image bounds
+            h, w = image.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            
+            cropped = image[y1:y2, x1:x2]
+            return cropped
+        
+        # 1. Perspective Warp (Primary)
+        if result.masks is not None:
+            # Get the coordinates of the mask
+            mask_coords = result.masks.xy[0] # List of [x, y]
+            if len(mask_coords) >= 4:
+                # Find the 4 corners using approxPolyDP
+                contour = mask_coords.astype(np.float32)
+                epsilon = 0.02 * cv2.arcLength(contour, True)
+                approx = cv2.approxPolyDP(contour, epsilon, True)
+                
+                if len(approx) != 4:
+                    # If not 4, try to force 4 by finding hull and then most distant points/indices
+                    hull = cv2.convexHull(contour)
+                    epsilon = 0.02 * cv2.arcLength(hull, True)
+                    approx = cv2.approxPolyDP(hull, epsilon, True)
+                
+                if len(approx) == 4:
+                    # Sort corners: top-left, top-right, bottom-right, bottom-left
+                    pts = approx.reshape(4, 2)
+                    rect = np.zeros((4, 2), dtype="float32")
+                    
+                    s = pts.sum(axis=1)
+                    rect[0] = pts[np.argmin(s)]
+                    rect[2] = pts[np.argmax(s)]
+                    
+                    diff = np.diff(pts, axis=1)
+                    rect[1] = pts[np.argmin(diff)]
+                    rect[3] = pts[np.argmax(diff)]
+                    
+                    # Define destination points (85.6mm x 54.0mm ratio)
+                    width = 1000
+                    height = 631
+                    dst = np.array([
+                        [0, 0],
+                        [width - 1, 0],
+                        [width - 1, height - 1],
+                        [0, height - 1]
+                    ], dtype="float32")
+                    
+                    # Perspective transform
+                    M = cv2.getPerspectiveTransform(rect, dst)
+                    warped = cv2.warpPerspective(image, M, (width, height))
+                    return warped
+
+        return image
+
     def extract(self, image_path):
         """Extract all fields from KTP"""
         start_time = time.time()
         
-        # Preprocess
+        # Load image
+        image = cv2.imread(image_path)
+        if image is None:
+            raise FileNotFoundError(f"Could not load image at {image_path}")
+            
+        # Preprocess - Perspective Correction First
         pre_start = time.time()
-        processed = self.preprocess(image_path)
+        
+        # 1. Detect and Warp
+        warped = self._detect_and_warp(image)
+        
+        # 2. Regular preprocessing on warped image
+        processed = self.preprocess_warped(warped)
         pre_time = time.time() - pre_start
         
         # Run OCR
@@ -674,6 +754,6 @@ if __name__ == '__main__':
     import json
     from ocr import KTPExtractor
     extractor = KTPExtractor()
-    image_path = 'images/ktp2.jpg'
+    image_path = 'images/original.jpg'
     result = extractor.extract(image_path)
     print(json.dumps(result, indent=2))
