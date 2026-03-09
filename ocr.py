@@ -752,8 +752,18 @@ class KTPExtractor:
 
 if __name__ == '__main__':
     import json
+    import time
     from ocr import KTPExtractor
+    
+    print("Initializing KTPExtractor (Loading PaddleOCR and YOLO Models)...")
+    start_init = time.time()
     extractor = KTPExtractor()
-    image_path = 'images/original.jpg'
+    print(f"Models loaded successfully in {time.time() - start_init:.2f} seconds.")
+    
+    image_path = 'images/ktp rifan.jpg'
+    print(f"Running extraction on {image_path}...")
+    start_ext = time.time()
     result = extractor.extract(image_path)
+    print(f"Extraction completed in {time.time() - start_ext:.2f} seconds.")
+    
     print(json.dumps(result, indent=2))
