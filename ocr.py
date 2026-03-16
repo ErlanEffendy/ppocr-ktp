@@ -1,4 +1,4 @@
-from paddleocr import PaddleOCR
+from rapidocr_onnxruntime import RapidOCR
 import cv2
 import re
 import json
@@ -112,15 +112,10 @@ class KTPExtractor:
     _seg_model_instance = None # Singleton pattern for Segmentation
     
     def __init__(self):
-        # Reuse OCR model across instances to avoid reloading
+        # Use RapidOCR (ONNXRuntime) for much faster CPU inference
+        # Enabled is_cls=True to handle messy or rotated orientations
         if KTPExtractor._ocr_instance is None:
-            KTPExtractor._ocr_instance = PaddleOCR(
-                use_textline_orientation=True,
-                use_gpu=False,
-                lang='en',
-                enable_mkldnn=True,       # Try adding this
-                cpu_threads=4             # And this (adjust to your CPU cores)
-            )
+            KTPExtractor._ocr_instance = RapidOCR(is_cls=True)
         self.ocr = KTPExtractor._ocr_instance
         
         # Load YOLOv11 segmentation model
@@ -287,14 +282,35 @@ class KTPExtractor:
         processed = self.preprocess_warped(warped)
         pre_time = time.time() - pre_start
         
-        # Run OCR
+        # Run OCR using RapidOCR (ONNXRuntime)
         ocr_start = time.time()
-        result = self.ocr.predict(processed)
+        # RapidOCR returns: [result, elapse]
+        # result is a list of [box, text, score]
+        ocr_result, _ = self.ocr(processed)
         ocr_time = time.time() - ocr_start
+        
+        # Convert RapidOCR format to the dictionary format expected by _extract_fields_hybrid
+        # result[0] needs to be a dict with rec_texts, rec_scores, rec_boxes
+        formatted_result = {
+            'rec_texts': [],
+            'rec_scores': [],
+            'rec_boxes': []
+        }
+        if ocr_result:
+            for box, text, score in ocr_result:
+                formatted_result['rec_texts'].append(text)
+                formatted_result['rec_scores'].append(score)
+                # RapidOCR boxes are 4 corners [[x,y],[x,y],[x,y],[x,y]]
+                # ocr.py expects x1, y1, x2, y2 for find_value_for_label boxes[i]
+                # but ocr.py also uses bx1 = box[0] which implies a flat list or nested
+                # Let's check _extract_fields_hybrid: find_value_for_label expects [x1, y1, x2, y2]
+                x_coords = [p[0] for p in box]
+                y_coords = [p[1] for p in box]
+                formatted_result['rec_boxes'].append([min(x_coords), min(y_coords), max(x_coords), max(y_coords)])
         
         # Extract fields using hybrid approach
         extract_start = time.time()
-        fields = self._extract_fields_hybrid(result[0], processed)
+        fields = self._extract_fields_hybrid(formatted_result, processed)
         
         # Validate
         validation = self._validate_fields(fields)
@@ -419,8 +435,9 @@ class KTPExtractor:
                 return None
 
             # Check for value in same block (after colon)
-            if ':' in label_text:
-                parts = label_text.split(':', 1)
+            if ':' in label_text or '：' in label_text:
+                sep = ':' if ':' in label_text else '：'
+                parts = label_text.split(sep, 1)
                 if len(parts) > 1:
                     val = parts[1].strip()
                     if val:
@@ -448,7 +465,11 @@ class KTPExtractor:
                         break
                         
                     if cx1 > lx1 + 5:
-                        val = curr_text.lstrip(': ').strip()
+                        # Don't pick up text from the signature/issuance area (usually starts after 65% width)
+                        if cx1 > img_w * 0.65:
+                            break
+                            
+                        val = curr_text.strip(' :：').strip()
                         if val:
                             if field_key == 'nik':
                                 nik = get_nik_from_str(val)
