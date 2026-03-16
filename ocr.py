@@ -116,7 +116,10 @@ class KTPExtractor:
         if KTPExtractor._ocr_instance is None:
             KTPExtractor._ocr_instance = PaddleOCR(
                 use_textline_orientation=True,
-                lang='en'
+                use_gpu=False,
+                lang='en',
+                enable_mkldnn=True,       # Try adding this
+                cpu_threads=4             # And this (adjust to your CPU cores)
             )
         self.ocr = KTPExtractor._ocr_instance
         
@@ -249,8 +252,8 @@ class KTPExtractor:
                     rect[3] = pts[np.argmax(diff)]
                     
                     # Define destination points (85.6mm x 54.0mm ratio)
-                    width = 1000
-                    height = 631
+                    width = 800
+                    height = 505
                     dst = np.array([
                         [0, 0],
                         [width - 1, 0],
@@ -760,7 +763,7 @@ if __name__ == '__main__':
     extractor = KTPExtractor()
     print(f"Models loaded successfully in {time.time() - start_init:.2f} seconds.")
     
-    image_path = 'images/ktp rifan.jpg'
+    image_path = 'images/ktp-1.jpg'
     print(f"Running extraction on {image_path}...")
     start_ext = time.time()
     result = extractor.extract(image_path)
