@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  ppocr-api:
+    build: .
+    container_name: ppocr_ktp_api
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./uploaded_files:/app/uploaded_files
+      - ./.cache_regional:/app/.cache_regional
+    restart: unless-stopped
