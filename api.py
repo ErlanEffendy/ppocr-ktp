@@ -5,6 +5,9 @@ from npwp_extractor import NPWPExtractor
 import os
 import uuid
 import shutil
+import tempfile
+
+SAVE_UPLOADED_FILES = os.getenv("SAVE_UPLOADED_FILES", "false").lower() == "true"
 
 app = FastAPI(title="KTP and NPWP OCR API")
 
@@ -23,8 +26,8 @@ async def extract_ktp(file: UploadFile = File(...)):
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File uploaded is not an image.")
     
-    # Store the uploaded file in uploaded_files/images/
-    upload_dir = os.path.join("uploaded_files", "images")
+    # Store the uploaded file in uploaded_files/images/ when persistence is enabled
+    upload_dir = os.path.join("uploaded_files", "images") if SAVE_UPLOADED_FILES else tempfile.gettempdir()
     os.makedirs(upload_dir, exist_ok=True)
     filename = f"{uuid.uuid4()}_{os.path.basename(file.filename)}"
     file_path = os.path.join(upload_dir, filename)
@@ -42,16 +45,16 @@ async def extract_ktp(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
     
     finally:
-        # Keep the files in uploaded_files/images/
-        pass
+        if not SAVE_UPLOADED_FILES and os.path.exists(file_path):
+            os.remove(file_path)
 
 @app.post("/extract-npwp")
 async def extract_npwp(file: UploadFile = File(...)):
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File uploaded is not an image.")
     
-    # Store the uploaded file in uploaded_files/images/
-    upload_dir = os.path.join("uploaded_files", "images")
+    # Store the uploaded file in uploaded_files/images/ when persistence is enabled
+    upload_dir = os.path.join("uploaded_files", "images") if SAVE_UPLOADED_FILES else tempfile.gettempdir()
     os.makedirs(upload_dir, exist_ok=True)
     filename = f"{uuid.uuid4()}_{os.path.basename(file.filename)}"
     file_path = os.path.join(upload_dir, filename)
@@ -69,7 +72,8 @@ async def extract_npwp(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
     
     finally:
-        pass
+        if not SAVE_UPLOADED_FILES and os.path.exists(file_path):
+            os.remove(file_path)
 
 if __name__ == "__main__":
     import uvicorn
