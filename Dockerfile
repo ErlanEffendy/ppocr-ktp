@@ -14,8 +14,17 @@ RUN apt-get update && apt-get install -y \
 
 COPY requirements.txt .
 
-# Pre-install CPU-only PyTorch to dramatically reduce image size and build time
-RUN pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# Upgrade pip/setuptools/wheel first. The slim image's pip can reject the +cpu
+# wheel tags and fall back to a source build, which needs flit_core (absent from
+# PyTorch's index) and fails. Recent pip accepts the wheels directly.
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# Pre-install CPU-only PyTorch to dramatically reduce image size and build time.
+# PyPI is kept as an extra index so any dependency/build backend still resolves.
+RUN pip install --no-cache-dir \
+    torch==2.6.0 torchvision==0.21.0 \
+    --index-url https://download.pytorch.org/whl/cpu \
+    --extra-index-url https://pypi.org/simple
 
 RUN pip install --no-cache-dir -r requirements.txt
 
